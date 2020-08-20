@@ -84,7 +84,7 @@ UINTN                   SecRegionOffset = 0;
 PCRYPTO_INFO            SecRegionCryptInfo = NULL;
 
 VOID
-CleanSensitiveData()
+CleanSensitiveData(BOOLEAN bClearBootParams)
 {
 	if (SecRegionCryptInfo != NULL) {
 		MEM_BURN(SecRegionCryptInfo, sizeof(*SecRegionCryptInfo));
@@ -97,6 +97,10 @@ CleanSensitiveData()
 	if (SecRegionData != NULL) {
 		MEM_BURN(SecRegionData, SecRegionSize);
 	}
+	
+	if (bootParams != NULL && bClearBootParams) {
+		MEM_BURN(bootParams, sizeof(*bootParams));
+	}
 
 	if (gAutoPassword != NULL) {
 		MEM_BURN(gAutoPassword, MAX_PASSWORD);
@@ -105,7 +109,7 @@ CleanSensitiveData()
 
 void HaltPrint(const CHAR16* Msg)
 {
-	CleanSensitiveData();
+	CleanSensitiveData(TRUE);
 	Print(L"%s - system Halted\n", Msg);
 	EfiCpuHalt();
 }
@@ -160,29 +164,33 @@ PrepareBootParams(
 	IN PCRYPTO_INFO   cryptoInfo)
 {
 	BootArguments           *bootArgs;
-	if (bootParams == NULL) return EFI_UNSUPPORTED;
-	bootArgs = &bootParams->BootArgs;
-	TC_SET_BOOT_ARGUMENTS_SIGNATURE(bootArgs->Signature);
-	bootArgs->BootLoaderVersion = VERSION_NUM;
-	bootArgs->CryptoInfoOffset = (uint16)(FIELD_OFFSET(BOOT_PARAMS, BootCryptoInfo));
-	bootArgs->CryptoInfoLength = (uint16)(sizeof(BOOT_CRYPTO_HEADER) + 2 + sizeof(SECREGION_BOOT_PARAMS));
-	bootArgs->HeaderSaltCrc32 = gHeaderSaltCrc32;
-	CopyMem(&bootArgs->BootPassword, &gAuthPassword, sizeof(gAuthPassword));
-	bootArgs->HiddenSystemPartitionStart = 0;
-	bootArgs->DecoySystemPartitionStart = 0;
-	bootArgs->BootDriveSignature = bootDriveSignature;
-	bootArgs->Flags = (uint32)(gAuthPim << 16);
-	bootArgs->BootArgumentsCrc32 = GetCrc32((byte *)bootArgs, (int)((byte *)&bootArgs->BootArgumentsCrc32 - (byte *)bootArgs));
-	bootParams->BootCryptoInfo.ea = (uint16)cryptoInfo->ea;
-	bootParams->BootCryptoInfo.mode = (uint16)cryptoInfo->mode;
-	bootParams->BootCryptoInfo.pkcs5 = (uint16)cryptoInfo->pkcs5;
-	SetSecRegionParamsMemory();
+	EFI_STATUS              status;
+	if (bootParams == NULL) status = EFI_UNSUPPORTED;
+	else {
+		bootArgs = &bootParams->BootArgs;
+		TC_SET_BOOT_ARGUMENTS_SIGNATURE(bootArgs->Signature);
+		bootArgs->BootLoaderVersion = VERSION_NUM;
+		bootArgs->CryptoInfoOffset = (uint16)(FIELD_OFFSET(BOOT_PARAMS, BootCryptoInfo));
+		bootArgs->CryptoInfoLength = (uint16)(sizeof(BOOT_CRYPTO_HEADER) + 2 + sizeof(SECREGION_BOOT_PARAMS));
+		bootArgs->HeaderSaltCrc32 = gHeaderSaltCrc32;
+		CopyMem(&bootArgs->BootPassword, &gAuthPassword, sizeof(gAuthPassword));
+		bootArgs->HiddenSystemPartitionStart = 0;
+		bootArgs->DecoySystemPartitionStart = 0;
+		bootArgs->BootDriveSignature = bootDriveSignature;
+		bootArgs->Flags = (uint32)(gAuthPim << 16);
+		bootArgs->BootArgumentsCrc32 = GetCrc32((byte *)bootArgs, (int)((byte *)&bootArgs->BootArgumentsCrc32 - (byte *)bootArgs));
+		bootParams->BootCryptoInfo.ea = (uint16)cryptoInfo->ea;
+		bootParams->BootCryptoInfo.mode = (uint16)cryptoInfo->mode;
+		bootParams->BootCryptoInfo.pkcs5 = (uint16)cryptoInfo->pkcs5;
+		SetSecRegionParamsMemory();
+		status = EFI_SUCCESS;
+	}
 
 	// Clean auth data
 	MEM_BURN(&gAuthPassword, sizeof(gAuthPassword));
 	MEM_BURN(&gAuthPim, sizeof(gAuthPim));
 
-	return EFI_SUCCESS;
+	return status;
 }
 
 void GetIntersection(uint64 start1, uint32 length1, uint64 start2, uint64 end2, uint64 *intersectStart, uint32 *intersectLength)
@@ -634,7 +642,7 @@ SecRegionChangePwd() {
 		if (key.UnicodeChar == 'r') {
 			MEM_BURN(&newPassword, sizeof(newPassword));
 			MEM_BURN(&confirmPassword, sizeof(confirmPassword));
-			CleanSensitiveData();
+			CleanSensitiveData(TRUE);
 			gST->RuntimeServices->ResetSystem(EfiResetCold, EFI_SUCCESS, 0, NULL);
 		}
 	}
@@ -708,6 +716,10 @@ SecRegionTryDecrypt()
 			break;
 		}	else {
 			ERR_PRINT(L"%a", gAuthErrorMsg);
+			// clear previous failed authentication information
+			MEM_BURN(&gAuthPassword, sizeof(gAuthPassword));
+			if (gAuthPimRqt)
+				MEM_BURN(&gAuthPim, sizeof(gAuthPim));
 		}
 		retry--;
 	} while (vcres != 0 && retry > 0);
@@ -881,7 +893,7 @@ OnExit(
 	
 	if (EFI_ERROR(retValue))
 	{
-		CleanSensitiveData();
+		CleanSensitiveData(TRUE);
 	}
 	
 	if (action == NULL) return retValue;
@@ -942,7 +954,7 @@ OnExit(
 			res = EfiFindPartByGUID(guid, &h);
 			if (EFI_ERROR(res)) {
 				ERR_PRINT(L"\nCan't find start partition\n");
-				CleanSensitiveData();
+				CleanSensitiveData(TRUE);
 				retValue = EFI_DCS_HALT_REQUESTED;
 				goto exit;
 			}
@@ -951,14 +963,14 @@ OnExit(
 				res = EfiExec(h, fileStr);
 				if (EFI_ERROR(res)) {
 					ERR_PRINT(L"\nStart %s - %r\n", fileStr, res);
-					CleanSensitiveData();
+					CleanSensitiveData(TRUE);
 					retValue = EFI_DCS_HALT_REQUESTED;
 					goto exit;
 				}
 			}
 			else {
 				ERR_PRINT(L"\nNo EFI execution path specified. Halting!\n");
-				CleanSensitiveData();
+				CleanSensitiveData(TRUE);
 				retValue = EFI_DCS_HALT_REQUESTED;
 				goto exit;
 			}
@@ -1008,7 +1020,7 @@ VirtualNotifyEvent(
 	)
 {
 	// Clean all sensible info and keys before transfer to OS
-	CleanSensitiveData();
+	CleanSensitiveData(FALSE);
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -1186,6 +1198,10 @@ UefiMain(
 	gST->ConIn->Reset(gST->ConIn, FALSE);
 
 	if (EFI_ERROR(res)) {
+		// clear buffers with potential authentication data
+		MEM_BURN(&gAuthPassword, sizeof(gAuthPassword));
+		MEM_BURN(&gAuthPim, sizeof(gAuthPim));
+
 		if (res == EFI_TIMEOUT)
 			return OnExit(gOnExitTimeout, OnExitAuthTimeout, res);
 		else if (res == EFI_DCS_USER_CANCELED)
